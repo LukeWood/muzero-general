@@ -1,6 +1,7 @@
 import math
 from abc import ABC, abstractmethod
 
+import torchvision
 import torch
 
 
@@ -101,7 +102,8 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
                 * observation_shape[1]
                 * observation_shape[2]
                 * (stacked_observations + 1)
-                + stacked_observations * observation_shape[1] * observation_shape[2],
+                + stacked_observations *
+                observation_shape[1] * observation_shape[2],
                 fc_representation_layers,
                 encoding_size,
             )
@@ -229,13 +231,39 @@ class ResidualBlock(torch.nn.Module):
         return x
 
 
+class VGG19DownSample(torch.nn.Module):
+    def __init__(self, original_model, out_channels):
+        super(VGG19DownSample, self).__init__()
+        # Everything except the last linear layer
+        self.features = torch.nn.Sequential(
+            *list(original_model.children())[:-1])
+        self.modelName = 'VGG19-Downsample'
+
+        self.resblocks1 = torch.nn.ModuleList(
+            [ResidualBlock(out_channels // 2) for _ in range(3)]
+        )
+
+        # Freeze those weights
+        for p in self.features.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        f = self.features(x)
+        f = f.view(f.size(0), -1)
+        x= f
+        for block in self.resblocks1:
+            x= block(x)
+        return x
+
 # Downsample observations before representation network (See paper appendix Network Architecture)
+
+
 class DownSample(torch.nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv1 = torch.nn.Conv2d(
             in_channels,
-            out_channels // 2,
+            out_channels // 3,
             kernel_size=3,
             stride=2,
             padding=1,
@@ -285,7 +313,8 @@ class DownsampleCNN(torch.nn.Module):
             ),
             torch.nn.ReLU(inplace=True),
             torch.nn.MaxPool2d(kernel_size=3, stride=2),
-            torch.nn.Conv2d(mid_channels, out_channels, kernel_size=5, padding=2),
+            torch.nn.Conv2d(mid_channels, out_channels,
+                            kernel_size=5, padding=2),
             torch.nn.ReLU(inplace=True),
             torch.nn.MaxPool2d(kernel_size=3, stride=2),
         )
@@ -309,7 +338,9 @@ class RepresentationNetwork(torch.nn.Module):
         super().__init__()
         self.downsample = downsample
         if self.downsample:
-            if self.downsample == "resnet":
+            if self.downsample == "vgg19":
+                self.downsample_net = VGG19DownSample(torchvision.models.vgg19(pretrained=False), num_channels)
+            elif self.downsample == "resnet":
                 self.downsample_net = DownSample(
                     observation_shape[0] * (stacked_observations + 1)
                     + stacked_observations,
@@ -326,12 +357,16 @@ class RepresentationNetwork(torch.nn.Module):
                     ),
                 )
             else:
-                raise NotImplementedError('downsample should be "resnet" or "CNN".')
-        self.conv = conv3x3(
-            observation_shape[0] * (stacked_observations + 1) + stacked_observations,
-            num_channels,
-        )
-        self.bn = torch.nn.BatchNorm2d(num_channels)
+                raise NotImplementedError(
+                    'downsample should be "resnet" or "CNN".')
+        else:
+            self.conv = conv3x3(
+                observation_shape[0] *
+                (stacked_observations + 1) + stacked_observations,
+                num_channels,
+            )
+            self.bn = torch.nn.BatchNorm2d(num_channels)
+
         self.resblocks = torch.nn.ModuleList(
             [ResidualBlock(num_channels) for _ in range(num_blocks)]
         )
@@ -406,8 +441,10 @@ class PredictionNetwork(torch.nn.Module):
             [ResidualBlock(num_channels) for _ in range(num_blocks)]
         )
 
-        self.conv1x1_value = torch.nn.Conv2d(num_channels, reduced_channels_value, 1)
-        self.conv1x1_policy = torch.nn.Conv2d(num_channels, reduced_channels_policy, 1)
+        self.conv1x1_value = torch.nn.Conv2d(
+            num_channels, reduced_channels_value, 1)
+        self.conv1x1_policy = torch.nn.Conv2d(
+            num_channels, reduced_channels_policy, 1)
         self.block_output_size_value = block_output_size_value
         self.block_output_size_policy = block_output_size_policy
         self.fc_value = mlp(
@@ -674,7 +711,8 @@ def scalar_to_support(x, support_size):
     x = torch.clamp(x, -support_size, support_size)
     floor = x.floor()
     prob = x - floor
-    logits = torch.zeros(x.shape[0], x.shape[1], 2 * support_size + 1).to(x.device)
+    logits = torch.zeros(x.shape[0], x.shape[1],
+                         2 * support_size + 1).to(x.device)
     logits.scatter_(
         2, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1)
     )
